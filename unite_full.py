@@ -62,6 +62,20 @@ Z_MAX = 1000
 manual_z = None         # None = auto
 
 
+# ===== Depth calibration (observed_z -> true_mm) =====
+DEPTH_CALIB_POINTS_MM = [500, 1000, 2000]     # 0.5m / 1.0m / 2.0m
+DEPTH_SAMPLE_SEC = 2.5                        # 1点あたりサンプリング秒
+DEPTH_MIN_FIX_CONF = 0.0                      # 0でOK（必要なら0.6などに）
+
+depth_calib_observed = {}  # { true_mm: observed_z_median }
+depth_calib_enabled = True
+
+# UI表示用
+depth_sampling = False
+depth_sampling_target = None
+depth_sampling_count = 0
+depth_sampling_last_obs = None
+
 
 def list_serial_ports():
     return [p.device for p in list_ports.comports()]
@@ -197,7 +211,16 @@ def controller_thread():
         elif latest_fix:
             age = (time.perf_counter() - latest_fix["t"]) * 1000
             if age <= FIXATION_STALE_MS:
-                target_z = map_z_mm_to_servo(latest_fix["z"])
+                observed_z = latest_fix["z"]  # gp[2]
+
+                # depth calib を適用
+                if depth_calib_enabled and len(depth_calib_observed) >= 2:
+                    true_mm = interp_observed_to_true_mm(observed_z)
+                    target_z = true_mm_to_zcmd(true_mm)
+                else:
+                    # 従来の荒いマップ（保険）
+                    target_z = map_z_mm_to_servo(observed_z)
+
                 
         if latest_fix:
             debug_fix_present = True
@@ -209,6 +232,46 @@ def controller_thread():
         last_tilt = target_tilt
         time.sleep(0.01)
 
+def interp_observed_to_true_mm(observed_z: float) -> float:
+    """
+    depth_calib_observed に基づき observed_z -> true_mm を区分線形で補正。
+    2点以上ない場合は observed_z をそのまま返す（=補正なし）。
+    """
+    if observed_z is None:
+        return None
+
+    if len(depth_calib_observed) < 2:
+        return float(observed_z)
+
+    # (observed_z, true_mm) のリストにして observed_z でソート
+    pairs = sorted([(oz, tm) for tm, oz in depth_calib_observed.items()], key=lambda x: x[0])
+
+    # 端より外は端の区間で外挿
+    if observed_z <= pairs[0][0]:
+        (x0, y0), (x1, y1) = pairs[0], pairs[1]
+        return y0 + (observed_z - x0) * (y1 - y0) / (x1 - x0 + 1e-9)
+
+    if observed_z >= pairs[-1][0]:
+        (x0, y0), (x1, y1) = pairs[-2], pairs[-1]
+        return y0 + (observed_z - x0) * (y1 - y0) / (x1 - x0 + 1e-9)
+
+    # 区間を見つけて補間
+    for (x0, y0), (x1, y1) in zip(pairs, pairs[1:]):
+        if x0 <= observed_z <= x1:
+            return y0 + (observed_z - x0) * (y1 - y0) / (x1 - x0 + 1e-9)
+
+    return float(observed_z)
+
+
+def true_mm_to_zcmd(true_mm: float) -> int:
+    """
+    真距離(mm) -> Zcmd(0..1000) に変換。
+    ここは作品都合でいじる場所。
+    """
+    Z_NEAR = 300   # 300mm未満は近すぎ扱い
+    Z_FAR  = 2000  # 2m以上は遠すぎ扱い
+    z = max(Z_NEAR, min(Z_FAR, float(true_mm)))
+    return int((z - Z_NEAR) / (Z_FAR - Z_NEAR) * 1000)
 
 
 # =========================================================
@@ -326,6 +389,21 @@ class App(tk.Tk):
         )
         self.z_scale.set(500)
         self.z_scale.pack(fill="x")
+        
+        ttk.Label(self, text="Depth Calib").pack(pady=(8,2))
+
+        btns = ttk.Frame(self)
+        btns.pack()
+
+        ttk.Button(btns, text="Calib @ 0.5m", command=lambda: self.start_depth_calib(500)).grid(row=0, column=0, padx=3)
+        ttk.Button(btns, text="Calib @ 1.0m", command=lambda: self.start_depth_calib(1000)).grid(row=0, column=1, padx=3)
+        ttk.Button(btns, text="Calib @ 2.0m", command=lambda: self.start_depth_calib(2000)).grid(row=0, column=2, padx=3)
+
+        self.depth_status = ttk.Label(self, text="depth: (not calibrated)")
+        self.depth_status.pack(pady=2)
+
+        self.depth_table = ttk.Label(self, text="")
+        self.depth_table.pack(pady=2)
 
         ttk.Button(self, text="Z Auto (Fixation)", command=self.set_z_auto).pack(fill="x")
 
@@ -428,7 +506,23 @@ class App(tk.Tk):
             self.zcmd_lbl.config(text=f"Zcmd: {target_z}")
         else:
             self.zcmd_lbl.config(text="Zcmd: ---")
+            
+        # depth calib status
+        if depth_sampling:
+            self.depth_status.config(
+                text=f"depth sampling: target={depth_sampling_target}mm  n={depth_sampling_count}  last_obs={depth_sampling_last_obs}"
+            )
+        else:
+            self.depth_status.config(text="depth: idle")
 
+        # show table
+        if len(depth_calib_observed) > 0:
+            rows = []
+            for tm in sorted(depth_calib_observed.keys()):
+                rows.append(f"{tm}mm -> obs_z={depth_calib_observed[tm]:.1f}")
+            self.depth_table.config(text=" | ".join(rows))
+        else:
+            self.depth_table.config(text="(no depth calib yet)")
 
         self.after(100, self.update_ui)
         
@@ -453,6 +547,48 @@ class App(tk.Tk):
     def set_z_auto(self):
         global manual_z
         manual_z = None
+        
+    def start_depth_calib(self, true_mm: int):
+    # 別スレッドでサンプリング（UI固まらない）
+        th = threading.Thread(target=self._depth_calib_worker, args=(true_mm,), daemon=True)
+        th.start()
+
+    def _depth_calib_worker(self, true_mm: int):
+        global depth_sampling, depth_sampling_target, depth_sampling_count, depth_sampling_last_obs
+        global depth_calib_observed
+
+        depth_sampling = True
+        depth_sampling_target = true_mm
+        depth_sampling_count = 0
+        depth_sampling_last_obs = None
+
+        samples = []
+        t_end = time.perf_counter() + DEPTH_SAMPLE_SEC
+
+        while time.perf_counter() < t_end and running:
+            if latest_fix:
+                age = (time.perf_counter() - latest_fix["t"]) * 1000
+                if age <= FIXATION_STALE_MS:
+                    conf = float(latest_fix.get("confidence", 1.0))
+                    if conf >= DEPTH_MIN_FIX_CONF:
+                        oz = float(latest_fix["z"])
+                        samples.append(oz)
+                        depth_sampling_last_obs = oz
+                        depth_sampling_count = len(samples)
+            time.sleep(0.01)
+
+        depth_sampling = False
+
+        if len(samples) < 5:
+            print("[DEPTH] not enough samples")
+            return
+
+        samples.sort()
+        median = samples[len(samples)//2]
+        depth_calib_observed[true_mm] = float(median)
+
+        print(f"[DEPTH] saved true={true_mm}mm -> observed_z(median)={median:.1f} (n={len(samples)})")
+
 
 # =========================================================
 # main
