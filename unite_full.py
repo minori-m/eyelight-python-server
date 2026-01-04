@@ -22,6 +22,8 @@ SMOOTHING = 0.3
 
 CONFIDENCE_TH = 0.95
 FIXATION_STALE_MS = 800
+GAZE_CONF_TH = 0.6   # ← まずはこれおすすめ
+
 
 # =========================================================
 # グローバル状態（JS state 完全対応）
@@ -33,7 +35,7 @@ is_calibrating = False
 tracking = False
 
 # 入力
-latest_gaze = None            # (x,y)
+latest_gaze = None            # {"x","y","confidence"}
 latest_fix = None             # dict
 
 # キャリブ
@@ -58,6 +60,8 @@ serial_connected = False
 Z_MIN = 0
 Z_MAX = 1000
 manual_z = None         # None = auto
+
+
 
 def list_serial_ports():
     return [p.device for p in list_ports.comports()]
@@ -104,7 +108,7 @@ def pupil_thread():
     sub = ctx.socket(zmq.SUB)
     sub.connect(f"tcp://127.0.0.1:{sub_port}")
     sub.setsockopt_string(zmq.SUBSCRIBE, "gaze.")
-    sub.setsockopt_string(zmq.SUBSCRIBE, "fixations")
+    sub.setsockopt_string(zmq.SUBSCRIBE, "fixation")
 
     poller = zmq.Poller()
     poller.register(sub, zmq.POLLIN)
@@ -116,14 +120,22 @@ def pupil_thread():
             msg = msgpack.loads(payload, raw=False)
 
             if topic.startswith(b"gaze"):
+                # print(msg.get("gaze_point_3d"))
                 n = msg.get("norm_pos")
+                conf = msg.get("confidence", 1.0)
                 if n and len(n) == 2:
-                    latest_gaze = (float(n[0]), float(n[1]))
+                    latest_gaze = {
+                        "x": float(n[0]),
+                        "y": float(n[1]),
+                        "confidence": float(conf),
+                        "t": time.perf_counter()
+                    }
 
-            if topic.startswith(b"fixations"):
+            if topic.startswith(b"fixation"):
                 if msg.get("method") != "3d gaze":
                     continue
                 gp = msg.get("gaze_point_3d")
+                print(gp)
                 n = msg.get("norm_pos")
                 if gp and n:
                     latest_fix = {
@@ -139,33 +151,59 @@ def pupil_thread():
 # =========================================================
 def controller_thread():
     global target_pan, target_tilt, target_z
+    global debug_fix_present, debug_fix_z_mm, debug_fix_conf, debug_fix_age
 
     last_pan = None
     last_tilt = None
 
     while running:
+        debug_fix_present = False
+        debug_fix_z_mm = None
+        debug_fix_conf = None
+        debug_fix_age = None
+
+        # =========================
+        # Pan / Tilt
+        # =========================
         if tracking and model and latest_gaze:
-            x, y = latest_gaze
-            pan, tilt = predict_affine(model, x, y)
+            if latest_gaze["confidence"] >= GAZE_CONF_TH:
+                x = latest_gaze["x"]
+                y = latest_gaze["y"]
 
-            if last_pan is not None:
-                pan = last_pan + SMOOTHING * (pan - last_pan)
-                tilt = last_tilt + SMOOTHING * (tilt - last_tilt)
+                pan, tilt = predict_affine(model, x, y)
 
-            target_pan = pan
-            target_tilt = tilt
+                if last_pan is not None:
+                    pan = last_pan + SMOOTHING * (pan - last_pan)
+                    tilt = last_tilt + SMOOTHING * (tilt - last_tilt)
 
-            # Z
-            if manual_z is not None:
-                target_z = manual_z
-            elif latest_fix:
-                age = (time.perf_counter() - latest_fix["t"]) * 1000
-                if age <= FIXATION_STALE_MS and latest_fix["confidence"] >= CONFIDENCE_TH:
-                    target_z = map_z_mm_to_servo(latest_fix["z"])
+                target_pan = pan
+                target_tilt = tilt
+            else:
+                # 瞬き中 → 固定
+                if last_pan is not None:
+                    target_pan = last_pan
+                    target_tilt = last_tilt
+
         else:
+            # ★ ここが欠けていた
             target_pan = manual_pan
             target_tilt = manual_tilt
+
+        # =========================
+        # Z
+        # =========================
+        if manual_z is not None:
             target_z = manual_z
+        elif latest_fix:
+            age = (time.perf_counter() - latest_fix["t"]) * 1000
+            if age <= FIXATION_STALE_MS:
+                target_z = map_z_mm_to_servo(latest_fix["z"])
+                
+        if latest_fix:
+            debug_fix_present = True
+            debug_fix_z_mm = latest_fix["z"]
+            debug_fix_conf = latest_fix["confidence"]
+            debug_fix_age = (time.perf_counter() - latest_fix["t"]) * 1000
 
         last_pan = target_pan
         last_tilt = target_tilt
@@ -291,12 +329,20 @@ class App(tk.Tk):
 
         ttk.Button(self, text="Z Auto (Fixation)", command=self.set_z_auto).pack(fill="x")
 
-
         ttk.Button(self, text="Add Point", command=self.add_point).pack(fill="x", pady=4)
         ttk.Button(self, text="Fit Model", command=self.fit).pack(fill="x")
 
         self.lbl = ttk.Label(self, text="status")
         self.lbl.pack(pady=6)
+        
+        self.gaze_lbl = ttk.Label(self, text="gaze ---")
+        self.gaze_lbl.pack(pady=2)
+        
+        self.fix_lbl = ttk.Label(self, text="fix: ---")
+        self.fix_lbl.pack(pady=2)
+
+        self.zcmd_lbl = ttk.Label(self, text="Zcmd: ---")
+        self.zcmd_lbl.pack(pady=2)
 
         self.after(100, self.update_ui)
 
@@ -334,8 +380,16 @@ class App(tk.Tk):
         if not latest_gaze:
             print("no gaze")
             return
-        calib_points.append((*latest_gaze, manual_pan, manual_tilt))
+        calib_points.append(
+            (
+                latest_gaze["x"],
+                latest_gaze["y"],
+                manual_pan,
+                manual_tilt
+            )
+        )
         print("ADD", calib_points[-1])
+
 
     def fit(self):
         global model
@@ -346,10 +400,35 @@ class App(tk.Tk):
     
     def update_ui(self):
         if latest_gaze:
-            self.lbl.config(text=f"gaze {latest_gaze[0]:.3f},{latest_gaze[1]:.3f}")
+            self.gaze_lbl.config(
+                text=(
+                    f"gaze x={latest_gaze['x']:.3f} "
+                    f"y={latest_gaze['y']:.3f} "
+                    f"conf={latest_gaze['confidence']:.2f}"
+                )
+            )
 
         if serial_connected:
             self.serial_status.config(text=f"Serial: CONNECTED ({serial_port})")
+            
+        # ===== fixation display =====
+        if debug_fix_present:
+            self.fix_lbl.config(
+                text=(
+                    f"fix: z={debug_fix_z_mm:.0f}mm "
+                    f"conf={debug_fix_conf:.2f} "
+                    f"age={debug_fix_age:.0f}ms"
+                )
+            )
+        else:
+            self.fix_lbl.config(text="fix: NONE")
+
+        # ===== Z command display =====
+        if target_z is not None:
+            self.zcmd_lbl.config(text=f"Zcmd: {target_z}")
+        else:
+            self.zcmd_lbl.config(text="Zcmd: ---")
+
 
         self.after(100, self.update_ui)
         
