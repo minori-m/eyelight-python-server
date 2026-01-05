@@ -78,6 +78,8 @@ depth_sampling_target = None
 depth_sampling_count = 0
 depth_sampling_last_obs = None
 
+PAN_TILT_SAMPLE_SEC = 0.7      # サンプリング時間
+PAN_TILT_MIN_CONF = 0.4        # gaze confidence 閾値
 
 def list_serial_ports():
     return [p.device for p in list_ports.comports()]
@@ -160,7 +162,7 @@ def map_z_mm_to_servo(z_mm):
 
     # 近い → 大、遠い → 小
     ratio = (z - Z_NEAR) / (Z_FAR - Z_NEAR)
-    return int((1.0 - ratio) * 1000)
+    return int(ratio * 1000)
 
 
 # =========================================================
@@ -514,18 +516,42 @@ class App(tk.Tk):
         manual_tilt = float(v)
 
     def add_point(self):
-        if not latest_gaze:
-            print("no gaze")
+        th = threading.Thread(target=self._add_point_worker, daemon=True)
+        th.start()
+
+    def _add_point_worker(self):
+        global calib_points
+
+        samples_x = []
+        samples_y = []
+
+        t_end = time.perf_counter() + PAN_TILT_SAMPLE_SEC
+
+        while time.perf_counter() < t_end and running:
+            if latest_gaze:
+                conf = latest_gaze.get("confidence", 1.0)
+                if conf >= PAN_TILT_MIN_CONF:
+                    samples_x.append(latest_gaze["x"])
+                    samples_y.append(latest_gaze["y"])
+            time.sleep(0.01)
+
+        if len(samples_x) < 5:
+            print("[ADD POINT] not enough samples")
             return
-        calib_points.append(
-            (
-                latest_gaze["x"],
-                latest_gaze["y"],
-                manual_pan,
-                manual_tilt
-            )
+
+        # median
+        samples_x.sort()
+        samples_y.sort()
+        mx = samples_x[len(samples_x)//2]
+        my = samples_y[len(samples_y)//2]
+
+        calib_points.append((mx, my, manual_pan, manual_tilt))
+
+        print(
+            f"[ADD POINT] gaze=({mx:.3f},{my:.3f}) "
+            f"pan={manual_pan:.1f} tilt={manual_tilt:.1f} "
+            f"(n={len(samples_x)})"
         )
-        print("ADD", calib_points[-1])
 
 
     def fit(self):
