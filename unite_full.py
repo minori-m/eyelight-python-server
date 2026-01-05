@@ -10,6 +10,7 @@ from tkinter import ttk
 from serial.tools import list_ports
 import json
 import os
+from pythonosc import dispatcher, osc_server
 
 # =========================================================
 # 設定
@@ -25,6 +26,13 @@ SMOOTHING = 0.3
 CONFIDENCE_TH = 0.95
 FIXATION_STALE_MS = 800
 GAZE_CONF_TH = 0.85   # ← まずはこれおすすめ
+
+Z_PITCH_EPS = 0.1
+last_pitch = None
+
+IPHONE_HOLD_SEC = 10.0   # ← ここ重要（0.8〜1.5おすすめ）
+iphone_mode_until = 0.0
+
 
 
 # =========================================================
@@ -81,6 +89,14 @@ depth_sampling_last_obs = None
 PAN_TILT_SAMPLE_SEC = 0.7      # サンプリング時間
 PAN_TILT_MIN_CONF = 0.4        # gaze confidence 閾値
 
+# ===== iPhone (ZigSim) input =====
+iphone_active = False
+iphone_last_t = 0.0
+
+iphone_touch_x = 0.0
+iphone_touch_y = 0.0
+iphone_pitch = None   # radians or degrees
+
 def list_serial_ports():
     return [p.device for p in list_ports.comports()]
 
@@ -133,6 +149,113 @@ def load_calibration_json(path="calibration.json"):
         print("[CALIB LOAD] depth calib loaded:", depth_calib_observed)
 
 
+
+def on_touch_x(addr, x):
+    global iphone_touch_x, iphone_active, iphone_last_t
+    iphone_touch_x = float(x)
+    iphone_active = True
+    iphone_last_t = time.perf_counter()
+
+def on_touch_y(addr, y):
+    global iphone_touch_y, iphone_active, iphone_last_t
+    iphone_touch_y = float(y)
+    iphone_active = True
+    iphone_last_t = time.perf_counter()
+
+def get_iphone_touch():
+    # [-1,1] → [0,1]
+    x = iphone_touch_x
+    y = iphone_touch_y
+    # x = (iphone_touch_x + 1.0) * 0.5
+    # y = (iphone_touch_y + 1.0) * 0.5
+    return x, y
+
+def on_quat(addr, x, y, z, w):
+    global iphone_pitch, iphone_active, iphone_last_t
+
+    # pitch（右手系想定）
+    pitch = math.asin(2.0 * (w * x - y * z))
+    iphone_pitch = x
+
+    iphone_active = True
+    iphone_last_t = time.perf_counter()
+
+def quaternion_to_pitch(qx, qy, qz, qw):
+    # pitch (X-axis rotation)
+    sinp = 2.0 * (qw * qx - qz * qy)
+    sinp = max(-1.0, min(1.0, sinp))
+    return math.asin(sinp)
+
+
+def osc_debug(addr, *args):
+    print("[OSC]", addr, args)
+
+def handle_zigsim_osc(addr, args):
+    global iphone_touch_x, iphone_touch_y
+    global iphone_pitch
+    global iphone_mode_until
+
+    now = time.perf_counter()
+
+    if addr == "/ZIGSIM/iphone/touch01":
+        iphone_touch_x = float(args[0])
+        iphone_mode_until = now + IPHONE_HOLD_SEC
+
+    elif addr == "/ZIGSIM/iphone/touch02":
+        iphone_touch_y = float(args[0])
+        iphone_mode_until = now + IPHONE_HOLD_SEC
+        
+    elif addr == "/ZIGSIM/iphone/quaternion":
+        qx, qy, qz, qw = args
+        iphone_pitch = quaternion_to_pitch(qx, qy, qz, qw)
+        iphone_last_t = time.perf_counter()
+        
+
+def zigsim_thread():
+    disp = dispatcher.Dispatcher()
+    disp.set_default_handler(
+        lambda addr, *args: handle_zigsim_osc(addr, args)
+    ) 
+    server = osc_server.ThreadingOSCUDPServer(
+        ("0.0.0.0", 9000), disp
+    )
+    print("[ZIGSIM] listening on 9000")
+    server.serve_forever()
+
+
+def touch_to_pan_tilt(x, y):
+    # x,y: 0..1
+    pan = map_touch_to_deg(x)
+    tilt = map_touch_to_deg(y)
+    return pan, tilt
+
+def pitch_to_zcmd(pitch):
+    if pitch is None:
+        return None
+
+    PITCH_MIN = -0.3
+    PITCH_MAX =  0.7
+
+    Z_MIN = 300
+    Z_MAX = 2000
+
+    # clamp
+    p = max(PITCH_MIN, min(PITCH_MAX, pitch))
+
+    # normalize 0..1
+    t = (p - PITCH_MIN) / (PITCH_MAX - PITCH_MIN)
+
+    # map to Z
+    return int(Z_MIN + t * (Z_MAX - Z_MIN))
+
+
+def map_touch_to_deg(v):
+    # v: -1.0 .. 1.0
+    v = max(-1.0, min(1.0, v))
+    return (v + 1.0) * 90.0   # → 0 .. 180
+
+def is_iphone_active():
+    return time.perf_counter() < iphone_mode_until
 
 # =========================================================
 # 数学ユーティリティ（Affine）
@@ -227,6 +350,7 @@ def controller_thread():
 
     last_pan = None
     last_tilt = None
+    last_pitch = None
 
     while running:
         debug_fix_present = False
@@ -237,7 +361,20 @@ def controller_thread():
         # =========================
         # Pan / Tilt
         # =========================
-        if tracking and model and latest_gaze:
+        
+        # ===== Input priority =====
+        if is_iphone_active():
+            # iPhone manual mode
+            tx, ty = get_iphone_touch()
+            target_pan = map_touch_to_deg(tx)
+            target_tilt = map_touch_to_deg(ty)
+            print("[CONTROLLER] iPhone touch mode:", tx, "->", target_pan,",", ty,"->", target_tilt)
+            # Z 制御（iPhone）
+            # if is_iphone_active() and iphone_pitch is not None:
+            #     target_z = pitch_to_zcmd(iphone_pitch)
+
+
+        elif tracking and model and latest_gaze:
             if latest_gaze["confidence"] >= GAZE_CONF_TH:
                 x = latest_gaze["x"]
                 y = latest_gaze["y"]
@@ -264,7 +401,12 @@ def controller_thread():
         # =========================
         # Z
         # =========================
-        if manual_z is not None:
+        
+        if is_iphone_active() and iphone_pitch is not None:
+            if last_pitch is None or abs(iphone_pitch - last_pitch) > Z_PITCH_EPS:
+                target_z = pitch_to_zcmd(iphone_pitch)
+                last_pitch = iphone_pitch
+        elif manual_z is not None:
             target_z = manual_z
         elif latest_fix:
             age = (time.perf_counter() - latest_fix["t"]) * 1000
@@ -482,6 +624,18 @@ class App(tk.Tk):
 
         self.zcmd_lbl = ttk.Label(self, text="Zcmd: ---")
         self.zcmd_lbl.pack(pady=2)
+        
+        self.input_lbl = ttk.Label(self, text="input: ---")
+        self.input_lbl.pack()
+        
+        if is_iphone_active():
+            src = "iPhone"
+        elif tracking:
+            src = "Pupil"
+        else:
+            src = "Manual"
+        self.input_lbl.config(text=f"input: {src}")
+
 
         self.after(100, self.update_ui)
 
@@ -689,6 +843,7 @@ if __name__ == "__main__":
     threading.Thread(target=pupil_thread, daemon=True).start()
     threading.Thread(target=controller_thread, daemon=True).start()
     threading.Thread(target=serial_thread, daemon=True).start()
+    threading.Thread(target=zigsim_thread, daemon=True).start()  # ← これ
 
     App().mainloop()
     running = False
