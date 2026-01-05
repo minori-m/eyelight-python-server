@@ -8,6 +8,8 @@ import numpy as np
 import tkinter as tk
 from tkinter import ttk
 from serial.tools import list_ports
+import json
+import os
 
 # =========================================================
 # 設定
@@ -22,7 +24,7 @@ SMOOTHING = 0.3
 
 CONFIDENCE_TH = 0.95
 FIXATION_STALE_MS = 800
-GAZE_CONF_TH = 0.6   # ← まずはこれおすすめ
+GAZE_CONF_TH = 0.85   # ← まずはこれおすすめ
 
 
 # =========================================================
@@ -80,6 +82,54 @@ depth_sampling_last_obs = None
 def list_serial_ports():
     return [p.device for p in list_ports.comports()]
 
+def save_calibration_json(path="calibration.json"):
+    if model is None:
+        print("[CALIB SAVE] no pan/tilt model")
+        return
+
+    Mp, Mt = model
+
+    data = {
+        "pan_tilt_model": {
+            "Mp": Mp.tolist(),
+            "Mt": Mt.tolist(),
+        },
+        "depth_calib": depth_calib_observed,
+        "meta": {
+            "timestamp": time.time()
+        }
+    }
+
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+    print(f"[CALIB SAVE] saved to {path}")
+
+def load_calibration_json(path="calibration.json"):
+    global model, depth_calib_observed
+
+    if not os.path.exists(path):
+        print("[CALIB LOAD] file not found:", path)
+        return
+
+    with open(path, "r") as f:
+        data = json.load(f)
+
+    # pan / tilt model
+    pt = data.get("pan_tilt_model")
+    if pt:
+        Mp = np.array(pt["Mp"], dtype=float)
+        Mt = np.array(pt["Mt"], dtype=float)
+        model = (Mp, Mt)
+        print("[CALIB LOAD] pan/tilt model loaded")
+
+    # depth calib
+    dc = data.get("depth_calib")
+    if dc:
+        # JSON は key が str になるので int に戻す
+        depth_calib_observed = {int(k): float(v) for k, v in dc.items()}
+        print("[CALIB LOAD] depth calib loaded:", depth_calib_observed)
+
 
 
 # =========================================================
@@ -103,9 +153,15 @@ def predict_affine(model, x, y):
 
 def map_z_mm_to_servo(z_mm):
     Z_NEAR = 300
-    Z_FAR = 5000
+    Z_FAR = 2000
+
+    # clamp
     z = max(Z_NEAR, min(Z_FAR, z_mm))
-    return int((z - Z_NEAR) / (Z_FAR - Z_NEAR) * 1000)
+
+    # 近い → 大、遠い → 小
+    ratio = (z - Z_NEAR) / (Z_FAR - Z_NEAR)
+    return int((1.0 - ratio) * 1000)
+
 
 # =========================================================
 # Pupil 受信スレッド
@@ -410,6 +466,9 @@ class App(tk.Tk):
         ttk.Button(self, text="Add Point", command=self.add_point).pack(fill="x", pady=4)
         ttk.Button(self, text="Fit Model", command=self.fit).pack(fill="x")
 
+        ttk.Button(self, text="Save Calib (JSON)", command=self.save_calib).pack(fill="x", pady=(6,0))
+        ttk.Button(self, text="Load Calib (JSON)", command=self.load_calib).pack(fill="x")
+        
         self.lbl = ttk.Label(self, text="status")
         self.lbl.pack(pady=6)
         
@@ -552,6 +611,13 @@ class App(tk.Tk):
     # 別スレッドでサンプリング（UI固まらない）
         th = threading.Thread(target=self._depth_calib_worker, args=(true_mm,), daemon=True)
         th.start()
+        
+    def save_calib(self):
+        save_calibration_json("calibration.json")
+
+    def load_calib(self):
+        load_calibration_json("calibration.json")
+
 
     def _depth_calib_worker(self, true_mm: int):
         global depth_sampling, depth_sampling_target, depth_sampling_count, depth_sampling_last_obs
