@@ -33,7 +33,8 @@ last_pitch = None
 IPHONE_HOLD_SEC = 10.0   # ← ここ重要（0.8〜1.5おすすめ）
 iphone_mode_until = 0.0
 
-
+PAN_MIN, PAN_MAX = 2, 130
+TILT_MIN, TILT_MAX = 10, 110
 
 # =========================================================
 # グローバル状態（JS state 完全対応）
@@ -96,6 +97,10 @@ iphone_last_t = 0.0
 iphone_touch_x = 0.0
 iphone_touch_y = 0.0
 iphone_pitch = None   # radians or degrees
+
+def clamp(v, vmin, vmax):
+    return max(vmin, min(vmax, v))
+
 
 def list_serial_ports():
     return [p.device for p in list_ports.comports()]
@@ -427,6 +432,10 @@ def controller_thread():
             debug_fix_z_mm = latest_fix["z"]
             debug_fix_conf = latest_fix["confidence"]
             debug_fix_age = (time.perf_counter() - latest_fix["t"]) * 1000
+            
+        # === safety clamp (最終段) ===
+        target_pan = clamp(target_pan, PAN_MIN, PAN_MAX)
+        target_tilt = clamp(target_tilt, TILT_MIN, TILT_MAX)
 
         last_pan = target_pan
         last_tilt = target_tilt
