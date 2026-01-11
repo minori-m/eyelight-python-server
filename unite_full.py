@@ -63,6 +63,13 @@ target_pan = 90
 target_tilt = 90
 target_z = None
 
+# ===== Serial command snapshot =====
+cmd_pan = None
+cmd_tilt = None
+cmd_z = None
+cmd_lock = threading.Lock()
+
+
 # ===== Serial =====
 serial_port = None      # 選択されたポート名
 serial_connected = False
@@ -433,6 +440,12 @@ def controller_thread():
             debug_fix_conf = latest_fix["confidence"]
             debug_fix_age = (time.perf_counter() - latest_fix["t"]) * 1000
             
+        # ===== 確定コマンドをスナップショット =====
+        with cmd_lock:
+            cmd_pan = int(round(target_pan))
+            cmd_tilt = int(round(target_tilt))
+            cmd_z = target_z
+                
         # === safety clamp (最終段) ===
         target_pan = clamp(target_pan, PAN_MIN, PAN_MAX)
         target_tilt = clamp(target_tilt, TILT_MIN, TILT_MAX)
@@ -512,9 +525,14 @@ def serial_thread():
                 serial_connected = False
                 continue
 
-        pan = int(round(target_pan))
-        tilt = int(round(target_tilt))
-        z = target_z
+        with cmd_lock:
+            if cmd_pan is None:
+                time.sleep(0.01)
+                continue
+            pan = cmd_pan
+            tilt = cmd_tilt
+            z = cmd_z
+
 
         if (pan, tilt, z) != last_sent:
             cmd = f"P{pan}T{tilt}"
