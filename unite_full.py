@@ -230,7 +230,7 @@ def zigsim_thread():
 
 def touch_to_pan_tilt(x, y):
     # x,y: 0..1
-    pan = map_touch_to_deg(x)
+    pan = 180-map_touch_to_deg(x)
     tilt = map_touch_to_deg(y)
     return pan, tilt
 
