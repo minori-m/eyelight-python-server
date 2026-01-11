@@ -36,6 +36,11 @@ iphone_mode_until = 0.0
 PAN_MIN, PAN_MAX = 2, 130
 TILT_MIN, TILT_MAX = 10, 110
 
+MAX_DEG_PER_SEC_PAN  = 120.0
+MAX_DEG_PER_SEC_TILT = 110.0
+MAX_Z_PER_SEC        = 800.0
+
+
 # =========================================================
 # グローバル状態（JS state 完全対応）
 # =========================================================
@@ -299,6 +304,12 @@ def map_z_mm_to_servo(z_mm):
     ratio = (z - Z_NEAR) / (Z_FAR - Z_NEAR)
     return int(ratio * 1000)
 
+def limit_rate(curr, target, max_per_sec, dt):
+    if curr is None:
+        return target
+    max_delta = max_per_sec * dt
+    return curr + max(-max_delta, min(max_delta, target - curr))
+
 
 # =========================================================
 # Pupil 受信スレッド
@@ -364,6 +375,12 @@ def controller_thread():
     last_pan = None
     last_tilt = None
     last_pitch = None
+    
+    last_pan_cmd = None
+    last_tilt_cmd = None
+    last_z_cmd = None
+    last_cmd_time = time.perf_counter()
+
 
     while running:
         debug_fix_present = False
@@ -441,15 +458,31 @@ def controller_thread():
             debug_fix_conf = latest_fix["confidence"]
             debug_fix_age = (time.perf_counter() - latest_fix["t"]) * 1000
             
+        # === safety clamp (最終段) ===
+        target_pan = clamp(target_pan, PAN_MIN, PAN_MAX)
+        target_tilt = clamp(target_tilt, TILT_MIN, TILT_MAX)
+            
+        # ===== rate limit (サッカード抑制) =====
+        now = time.perf_counter()
+        dt = now - last_cmd_time
+        last_cmd_time = now
+
+        target_pan  = limit_rate(last_pan_cmd,  target_pan,  MAX_DEG_PER_SEC_PAN,  dt)
+        target_tilt = limit_rate(last_tilt_cmd, target_tilt, MAX_DEG_PER_SEC_TILT, dt)
+        if target_z is not None:
+            target_z = limit_rate(last_z_cmd, target_z, MAX_Z_PER_SEC, dt)
+
+        last_pan_cmd  = target_pan
+        last_tilt_cmd = target_tilt
+        last_z_cmd    = target_z
+
+            
         # ===== 確定コマンドをスナップショット =====
         with cmd_lock:
             cmd_pan = int(round(target_pan))
             cmd_tilt = int(round(target_tilt))
             cmd_z = target_z
                 
-        # === safety clamp (最終段) ===
-        target_pan = clamp(target_pan, PAN_MIN, PAN_MAX)
-        target_tilt = clamp(target_tilt, TILT_MIN, TILT_MAX)
 
         last_pan = target_pan
         last_tilt = target_tilt
