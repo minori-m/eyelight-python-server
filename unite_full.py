@@ -358,6 +358,7 @@ def pupil_thread():
 # =========================================================
 def controller_thread():
     global target_pan, target_tilt, target_z
+    global cmd_pan, cmd_tilt, cmd_z   # ← ★これを追加
     global debug_fix_present, debug_fix_z_mm, debug_fix_conf, debug_fix_age
 
     last_pan = None
