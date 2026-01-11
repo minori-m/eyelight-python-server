@@ -173,7 +173,7 @@ def get_iphone_touch():
     y = iphone_touch_y
     # x = (iphone_touch_x + 1.0) * 0.5
     # y = (iphone_touch_y + 1.0) * 0.5
-    return x, y
+    return -x, y
 
 def on_quat(addr, x, y, z, w):
     global iphone_pitch, iphone_active, iphone_last_t
